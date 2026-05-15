@@ -24,6 +24,7 @@
 #include <linux/atomic.h>
 #include <linux/bitmap.h>
 #include <linux/bug.h>
+#include <linux/kernfs.h>
 #include <linux/capability.h>
 #include <linux/cgroup_api.h>
 #include <linux/cgroup.h>
@@ -1969,6 +1970,35 @@ static inline struct task_group *task_group(struct task_struct *p)
 	return p->sched_task_group;
 }
 
+/**
+ * task_is_ui_critical - check if a task belongs to top-app or is a critical UI process
+ *
+ * Checks if the task name matches surfaceflinger or systemui, or walks the
+ * task_group hierarchy looking for a cgroup named "top-app".
+ */
+static inline bool task_is_ui_critical(struct task_struct *p)
+{
+	struct task_group *tg;
+
+	if (!p)
+		return false;
+
+	if (strstr(p->comm, "surfaceflinger") ||
+	    strstr(p->comm, "systemui") ||
+	    !strncmp(p->comm, "com.android.sys", 15))
+		return true;
+
+	tg = task_group(p);
+	while (tg && tg != &root_task_group) {
+		if (tg->css.cgroup && tg->css.cgroup->kn &&
+		    !strcmp(tg->css.cgroup->kn->name, "top-app"))
+			return true;
+		tg = tg->parent;
+	}
+	return false;
+}
+
+
 /* Change a task's cfs_rq and parent entity if it moves across CPUs/groups */
 static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
 {
@@ -1995,6 +2025,11 @@ static inline void set_task_rq(struct task_struct *p, unsigned int cpu) { }
 static inline struct task_group *task_group(struct task_struct *p)
 {
 	return NULL;
+}
+
+static inline bool task_is_ui_critical(struct task_struct *p)
+{
+	return false;
 }
 
 #endif /* CONFIG_CGROUP_SCHED */

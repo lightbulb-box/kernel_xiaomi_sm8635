@@ -1535,6 +1535,14 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 	if (unlikely(uc_req.value > uc_max.value))
 		return uc_max;
 
+#ifdef CONFIG_CGROUP_SCHED
+	if (clamp_id == UCLAMP_MIN && uc_req.value < 100 &&
+	    task_is_ui_critical(p)) {
+		uc_req.value = 100;
+		uc_req.bucket_id = uclamp_bucket_id(100);
+	}
+#endif
+
 	return uc_req;
 }
 

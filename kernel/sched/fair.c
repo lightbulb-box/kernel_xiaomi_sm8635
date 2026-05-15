@@ -698,15 +698,26 @@ int sched_update_scaling(void)
 }
 #endif
 
+#define TOP_APP_VRUNTIME_DIVISOR  4
+
 /*
  * delta /= w
  */
 static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
 {
-	if (unlikely(se->load.weight != NICE_0_LOAD))
-		delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
+	u64 vdelta;
 
-	return delta;
+	if (unlikely(se->load.weight != NICE_0_LOAD))
+		vdelta = __calc_delta(delta, NICE_0_LOAD, &se->load);
+	else
+		vdelta = delta;
+
+#ifdef CONFIG_CGROUP_SCHED
+	if (entity_is_task(se) && task_is_ui_critical(task_of(se)))
+		vdelta /= TOP_APP_VRUNTIME_DIVISOR;
+#endif
+
+	return vdelta;
 }
 
 /*
@@ -4714,6 +4725,11 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial)
 
 		vruntime -= thresh;
 	}
+
+#ifdef CONFIG_CGROUP_SCHED
+	if (entity_is_task(se) && task_is_ui_critical(task_of(se)))
+		vruntime -= sysctl_sched_latency;
+#endif
 
 	trace_android_rvh_place_entity(cfs_rq, se, initial, &vruntime);
 	/*
