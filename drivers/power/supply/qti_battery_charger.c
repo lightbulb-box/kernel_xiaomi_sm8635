@@ -837,6 +837,7 @@ struct battery_chg_dev {
 	u8				chg_ctrl_end_thr;
 	u8				glink_crash_count;
 	bool				chg_ctrl_en;
+	bool				bypass_chg_disable_on_shutdown;
 	bool				usb_active[NUM_USB_PORTS];
 	/* To track the driver initialization status */
 	bool				initialized;
@@ -1967,7 +1968,7 @@ static int battery_chg_callback(void *priv, void *data, size_t len)
 	down_read(&bcdev->state_sem);
 	if (!bcdev->initialized) {
 		pr_debug("Driver initialization failed: Dropping glink callback message: state %d\n",
-			 bcdev->state);
+			 atomic_read(&bcdev->state));
 		up_read(&bcdev->state_sem);
 		return 0;
 	}
@@ -2950,6 +2951,24 @@ static int get_charge_control_en(struct battery_chg_dev *bcdev)
 	return rc;
 }
 
+static int battery_psy_set_charge_control_en(struct battery_chg_dev *bcdev,
+					       bool val)
+{
+	int rc;
+
+	if (val == bcdev->chg_ctrl_en)
+		return 0;
+
+	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
+				BATT_CHG_CTRL_EN, val);
+	if (rc < 0)
+		return rc;
+
+	bcdev->chg_ctrl_en = val;
+
+	return 0;
+}
+
 static int __battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 					u32 fcc_ua)
 {
@@ -3749,16 +3768,9 @@ static ssize_t charge_control_en_store(struct class *c,
 	if (kstrtobool(buf, &val))
 		return -EINVAL;
 
-	if (val == bcdev->chg_ctrl_en)
-		return count;
-
-	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
-				BATT_CHG_CTRL_EN, val);
-	if (rc < 0) {
+	rc = battery_psy_set_charge_control_en(bcdev, val);
+ 	if (rc < 0)
 		return rc;
-	}
-
-	bcdev->chg_ctrl_en = val;
 
 	return count;
 }
@@ -3777,6 +3789,40 @@ static ssize_t charge_control_en_show(struct class *c,
 	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->chg_ctrl_en);
 }
 static CLASS_ATTR_RW(charge_control_en);
+
+/*
+ * Bypass charging leaves the charger IC in pass-through mode, which is
+ * retained across AP/ADSP power-down and breaks offline charging. This
+ * node controls whether the driver automatically reverts
+ * charge_control_en to 0 before SYS_POWER_OFF/SYS_RESTART.
+ */
+static ssize_t bypass_chg_disable_on_shutdown_store(struct class *c,
+				struct class_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	bool val;
+
+	if (kstrtobool(buf, &val))
+		return -EINVAL;
+
+	bcdev->bypass_chg_disable_on_shutdown = val;
+
+	return count;
+}
+
+static ssize_t bypass_chg_disable_on_shutdown_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			  bcdev->bypass_chg_disable_on_shutdown);
+}
+static CLASS_ATTR_RW(bypass_chg_disable_on_shutdown);
+
 
 static ssize_t fastcharge_enable_store(struct class *c,
                     struct class_attribute *attr,
@@ -7127,7 +7173,7 @@ static ssize_t request_vdm_cmd_show(struct class *c,
 			return rc;
 		for (i = 0; i < USBPD_UVDM_SS_LEN; i++) {
 			memset(data, 0, sizeof(data));
-			snprintf(data, sizeof(data), "%08lx", bcdev->ss_auth_data[i]);
+			snprintf(data, sizeof(data), "%08x", bcdev->ss_auth_data[i]);
 			strlcat(str_buf, data, sizeof(str_buf));
 		}
 		return snprintf(buf, PAGE_SIZE, "%d,%s", cmd, str_buf);
@@ -9936,6 +9982,7 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_usb_real_type.attr,
 	&class_attr_usb_typec_compliant.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_chg_disable_on_shutdown.attr,
 	&class_attr_cp_mode.attr,
 	&class_attr_bq2597x_chip_ok.attr,
 	&class_attr_bq2597x_slave_chip_ok.attr,
@@ -10254,6 +10301,7 @@ static struct attribute *battery_class_usb_2_attrs[] = {
 	&class_attr_usb_typec_compliant.attr,
 	&class_attr_usb_2_typec_compliant.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_chg_disable_on_shutdown.attr,
 	&class_attr_fastcharge_enable.attr,
 	NULL,
 };
@@ -10272,6 +10320,7 @@ static struct attribute *battery_class_no_wls_attrs[] = {
 	&class_attr_usb_typec_compliant.attr,
 	&class_attr_usb_num_ports.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_chg_disable_on_shutdown.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class_no_wls);
@@ -10293,6 +10342,7 @@ static struct attribute *battery_class_usb_2_no_wls_attrs[] = {
 	&class_attr_usb_num_ports.attr,
 	&class_attr_usb_2_typec_compliant.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_chg_disable_on_shutdown.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class_usb_2_no_wls);
@@ -10538,7 +10588,14 @@ static int battery_chg_shutdown(struct notifier_block *nb, unsigned long code,
 	msg.hdr.opcode = BC_SHUTDOWN_REQ_SET;
 
 	if (code == SYS_POWER_OFF || code == SYS_RESTART) {
-		;
+		if (bcdev->chg_ctrl_en && bcdev->bypass_chg_disable_on_shutdown) {
+			rc = battery_psy_set_charge_control_en(bcdev, false);
+			if (rc < 0)
+				pr_err("Failed to disable bypass charging before shutdown, rc=%d\n",
+					rc);
+			else
+				pr_err("Disabled bypass charging before shutdown for offline charging\n");
+		}
 
 #if defined(CONFIG_MI_WIRELESS)
 		rc = read_property_id(bcdev, pst, XM_PROP_WLS_FW_STATE);
@@ -11081,6 +11138,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	bcdev->glink_crash_count = 0;
 	bcdev->read_capacity_timeout = false;
 	bcdev->glink_crash_timeout_reset_flag = false;
+	bcdev->bypass_chg_disable_on_shutdown = true;
 
 	bcdev->chg_nb.notifier_call = charger_notifier_event;
 	charger_reg_notifier(&bcdev->chg_nb);
